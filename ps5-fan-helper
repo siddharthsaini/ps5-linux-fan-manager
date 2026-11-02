@@ -1,0 +1,386 @@
+#!/usr/bin/python3
+"""Privileged helper for PS5 Fan Manager.
+
+Only this process writes to hwmon. It listens on a local Unix socket and
+restores the driver's automatic mode when the GUI disconnects or it exits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import select
+import signal
+import socket
+import stat
+import struct
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import core  # noqa: E402
+
+
+def log(message):
+    print(f"ps5-fan-helper: {message}", file=sys.stderr, flush=True)
+
+
+def peer_uid(sock):
+    try:
+        raw = sock.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        return struct.unpack("3i", raw)[1]
+    except OSError:
+        return None
+
+
+class Client:
+    def __init__(self, sock):
+        self.sock = sock
+        self.buffer = b""
+
+
+class Helper:
+    def __init__(self, socket_path, hwmon_root, allowed_uid):
+        self.socket_path = socket_path
+        self.hwmon_root = hwmon_root
+        self.allowed_uid = allowed_uid
+        self.server = None
+        self.clients = []
+        self.state = None
+        self.hwmon = None
+        self.controller = core.FanController()
+        self.took_control = False
+        self.fault = None
+        self.last_status = None
+        self.next_tick = 0.0
+        self.running = True
+
+    # ---- hardware -----------------------------------------------------
+    def hwmon_path(self):
+        if self.hwmon and os.path.isdir(self.hwmon):
+            return self.hwmon
+        self.hwmon = core.find_hwmon(self.hwmon_root)
+        if not self.hwmon:
+            raise RuntimeError("ps5_fan hwmon device not found")
+        return self.hwmon
+
+    def take_control(self):
+        path = self.hwmon_path()
+        core.write_value(os.path.join(path, "pwm1_enable"), 1)
+        current = core.read_pwm(path)
+        span = max(0, self.state["max_pwm"] - self.state["min_pwm"])
+        fraction = (current - self.state["min_pwm"]) / span if span else 0.0
+        self.controller.reset(fraction)
+        self.took_control = True
+
+    def restore_auto(self):
+        if not self.took_control:
+            return
+        self.write_auto()
+
+    def write_auto(self):
+        try:
+            path = self.hwmon_path()
+            core.write_value(os.path.join(path, "pwm1_enable"), 2)
+            log("driver automatic mode restored")
+        except Exception as exc:  # noqa: BLE001
+            log(f"could not restore driver automatic mode: {exc}")
+        finally:
+            self.took_control = False
+
+    def initial_safe_state(self):
+        """Return the fan to driver auto after a crash/restart or fresh boot."""
+        try:
+            path = self.hwmon_path()
+            core.write_value(os.path.join(path, "pwm1_enable"), 2)
+            log("initial fan state set to driver automatic mode")
+        except Exception as exc:  # noqa: BLE001
+            log(f"initial auto mode not available: {exc}")
+
+    # ---- state --------------------------------------------------------
+    def apply_state(self, raw):
+        try:
+            state = core.normalize_config(raw)
+            path = self.hwmon_path()
+            old = self.state
+            if old is None or not self.took_control:
+                self.state = state
+                self.take_control()
+            else:
+                self.state = state
+            if (
+                old is not None
+                and (
+                    old["mode"] != state["mode"]
+                    or old["min_pwm"] != state["min_pwm"]
+                    or old["max_pwm"] != state["max_pwm"]
+                )
+            ):
+                self.take_control()
+            if state["mode"] == "manual":
+                pwm = state["manual_pwm"]
+                if core.read_pwm(path) != pwm:
+                    core.write_value(os.path.join(path, "pwm1"), pwm)
+            self.fault = None
+            self.next_tick = 0.0
+        except Exception as exc:  # noqa: BLE001
+            self.set_fault(str(exc))
+
+    def set_fault(self, message):
+        if not self.fault:
+            log(message)
+        self.fault = message
+        if self.state and self.state["mode"] != "manual":
+            self.restore_auto()
+        self.broadcast(self.status_payload())
+
+    def status_payload(self, temps=None, label=None, celsius=None, pwm=None, target=None):
+        state = self.state or {}
+        return {
+            "type": "status",
+            "ready": True,
+            "mode": state.get("mode"),
+            "target": target,
+            "temps": temps or [],
+            "sensor": label,
+            "temp": celsius,
+            "pwm": pwm,
+            "color": core.temp_color(celsius),
+            "fault": self.fault,
+            "restore_on_exit": state.get("restore_on_exit", True),
+        }
+
+    # ---- control ------------------------------------------------------
+    def tick(self):
+        if not self.state:
+            return
+        state = self.state
+        path = self.hwmon_path()
+        try:
+            temps = core.read_temps(path)
+        except Exception as exc:  # noqa: BLE001
+            self.set_fault(f"temperature read failed: {exc}")
+            return
+
+        label, celsius = core.select_temp(temps, state["use_hottest"])
+        pwm = core.read_pwm(path)
+
+        if state["mode"] == "manual":
+            desired = state["manual_pwm"]
+            if self.fault:
+                self.fault = None
+            if pwm != desired:
+                try:
+                    core.write_value(os.path.join(path, "pwm1"), desired)
+                    pwm = desired
+                except Exception as exc:  # noqa: BLE001
+                    self.fault = f"PWM write failed: {exc}"
+            self.broadcast(
+                self.status_payload(temps, label, celsius, pwm, target=None)
+            )
+            return
+
+        if label is None:
+            self.set_fault("no temperature sensors available")
+            return
+
+        if self.fault:
+            log("temperature reading recovered; retaking fan control")
+            self.fault = None
+            self.take_control()
+
+        target = state["target"]
+        try:
+            if celsius >= core.CRITICAL_TEMP:
+                desired = core.MAX_PWM
+                self.controller.force_max()
+            else:
+                desired = self.controller.update(
+                    celsius,
+                    target,
+                    state["min_pwm"],
+                    state["max_pwm"],
+                )
+            if pwm != desired:
+                core.write_value(os.path.join(path, "pwm1"), desired)
+                pwm = desired
+        except Exception as exc:  # noqa: BLE001
+            self.set_fault(f"fan control failed: {exc}")
+            return
+
+        self.broadcast(self.status_payload(temps, label, celsius, pwm, target))
+
+    # ---- clients ------------------------------------------------------
+    def broadcast(self, payload):
+        if not payload:
+            return
+        self.last_status = payload
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        for client in list(self.clients):
+            try:
+                client.sock.sendall(data)
+            except OSError:
+                self.close_client(client)
+
+    def close_client(self, client):
+        if client in self.clients:
+            self.clients.remove(client)
+        try:
+            client.sock.close()
+        except OSError:
+            pass
+        if not self.clients:
+            self.on_last_disconnect()
+
+    def on_last_disconnect(self):
+        state = self.state
+        self.state = None
+        self.last_status = None
+        if state and state.get("restore_on_exit", True):
+            self.restore_auto()
+        elif self.took_control:
+            log("GUI disconnected; leaving fan at its last PWM setting")
+        self.fault = None
+
+    def handle_command(self, client, payload):
+        command = payload.get("cmd")
+        if command == "state":
+            self.apply_state(payload.get("state", {}))
+        elif command == "release":
+            self.state = None
+            self.restore_auto()
+            self.broadcast(self.status_payload())
+        else:
+            log(f"unknown command: {command!r}")
+
+    def read_client(self, client):
+        try:
+            data = client.sock.recv(65536)
+        except OSError:
+            self.close_client(client)
+            return
+        if not data:
+            self.close_client(client)
+            return
+        client.buffer += data
+        while b"\n" in client.buffer:
+            line, client.buffer = client.buffer.split(b"\n", 1)
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except (ValueError, TypeError):
+                log("ignored malformed command")
+                continue
+            self.handle_command(client, payload)
+
+    def accept_client(self):
+        try:
+            sock, _ = self.server.accept()
+        except OSError:
+            return
+        uid = peer_uid(sock)
+        if uid != self.allowed_uid:
+            log(f"rejected client uid={uid}")
+            sock.close()
+            return
+        sock.setblocking(False)
+        client = Client(sock)
+        self.clients.append(client)
+        log(f"GUI connected (uid={uid})")
+        self.broadcast(self.last_status or self.status_payload())
+
+    # ---- lifecycle ----------------------------------------------------
+    def setup_socket(self):
+        directory = os.path.dirname(self.socket_path)
+        os.makedirs(directory, exist_ok=True)
+        try:
+            if stat.S_ISSOCK(os.stat(self.socket_path).st_mode):
+                os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log(f"cannot remove old socket: {exc}")
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(self.socket_path)
+        os.chmod(self.socket_path, 0o660)
+        if os.geteuid() == 0:
+            try:
+                gid = pwd.getpwuid(self.allowed_uid).pw_gid
+                os.chown(self.socket_path, 0, gid)
+            except (KeyError, OSError) as exc:
+                log(f"could not set socket group: {exc}")
+        self.server.listen(4)
+
+    def stop(self, *_args):
+        self.running = False
+
+    def run(self):
+        self.initial_safe_state()
+        self.setup_socket()
+        log(f"listening on {self.socket_path}")
+        try:
+            while self.running:
+                now = time.monotonic()
+                timeout = 1.0
+                if self.state and not self.fault:
+                    timeout = max(0.0, min(timeout, self.next_tick - now))
+                try:
+                    readable, _, _ = select.select(
+                        [self.server] + [client.sock for client in self.clients],
+                        [],
+                        [],
+                        timeout,
+                    )
+                except (OSError, ValueError):
+                    break
+                for sock in readable:
+                    if sock is self.server:
+                        self.accept_client()
+                    else:
+                        for client in list(self.clients):
+                            if client.sock is sock:
+                                self.read_client(client)
+                                break
+                now = time.monotonic()
+                if self.state and now >= self.next_tick:
+                    self.tick()
+                    self.next_tick = time.monotonic() + core.POLL_SECONDS
+        finally:
+            self.restore_auto()
+            for client in list(self.clients):
+                try:
+                    client.sock.close()
+                except OSError:
+                    pass
+            try:
+                self.server.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(self.socket_path)
+            except OSError:
+                pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PS5 Fan Manager privileged helper")
+    parser.add_argument("--socket", default=core.SOCKET_PATH)
+    parser.add_argument("--fake-root", help="use a fake hwmon tree for testing")
+    parser.add_argument("--uid", type=int, default=os.getuid(), help="allowed GUI user")
+    args = parser.parse_args()
+
+    helper = Helper(args.socket, args.fake_root or core.HWMON_ROOT, args.uid)
+    signal.signal(signal.SIGTERM, helper.stop)
+    signal.signal(signal.SIGINT, helper.stop)
+    helper.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PS5 Fan Manager
+Comment=Control the PS5 fan from the top bar
+Exec=/usr/local/bin/ps5-fan-manager --show
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+X-GNOME-Autostart-enabled=true
