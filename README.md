@@ -2,6 +2,11 @@
 
 A small GNOME/Ubuntu top-bar app for the PS5 fan hwmon driver.
 
+<p align="center">
+<img src="/media/ss1.png" alt="purifier">
+<img src="/media/ss2.png" alt="dashoboard">
+</p>
+
 Requires Python 3, GTK 3, and the Ayatana AppIndicator bindings. On Ubuntu:
 
 ```sh
