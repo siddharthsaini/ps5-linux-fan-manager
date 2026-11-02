@@ -1,6 +1,7 @@
 # PS5 Fan Manager
 
 A small GNOME/Ubuntu top-bar app for the PS5 fan hwmon driver
+
 Prereq: a jailbroken PS5 running Ubuntu from https://github.com/ps5-linux/ps5-linux-image on kernel 7.2.3
 
 <p align="center">
